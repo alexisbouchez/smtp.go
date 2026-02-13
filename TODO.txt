@@ -1,0 +1,651 @@
+================================================================================
+  smtp.go — MASTER TODO
+================================================================================
+
+  This file is the single source of truth for what needs to be built, in what
+  order, and what "done" looks like for each item. Work through the phases
+  sequentially — each phase builds on the previous one.
+
+  Notation:
+    [ ]  = not started
+    [~]  = in progress
+    [x]  = done
+    [!]  = blocked or needs decision
+
+  IMPORTANT — CLAUDE.md maintenance:
+    CLAUDE.md is fed to every future Claude Code session. It MUST stay accurate.
+    After EVERY phase completion (and after any significant architectural change
+    within a phase), review CLAUDE.md and update it to reflect:
+      - New packages, files, or structural changes
+      - New or changed build/test commands
+      - Updated architecture descriptions
+      - New conventions discovered during implementation
+      - Removed or renamed abstractions
+    Treat a stale CLAUDE.md as a bug. If the code and CLAUDE.md disagree, fix
+    CLAUDE.md before moving on. This is a gate for every phase checkpoint below.
+
+
+================================================================================
+  PHASE 0 — PROJECT SCAFFOLD & FOUNDATIONS                           ✅ COMPLETE
+================================================================================
+
+  Goal: Establish the module structure, shared types, and wire protocol layer
+  so that Phase 1 and Phase 2 can build on a solid base.
+
+  [x] 0.1  Create package directory structure:
+           smtp.go/              (root package: shared types)
+           smtp.go/smtpclient/   (client)
+           smtp.go/smtpserver/   (server)
+           smtp.go/internal/textproto/  (wire protocol)
+
+  [x] 0.2  Root package — Reply codes (RFC 5321 §4.2.1, §4.2.2):
+           - ReplyCode type with all standard codes as typed constants
+           - Class(), IsPositive(), IsTransient(), IsPermanent() methods
+           Implemented in: reply.go
+
+  [x] 0.3  Root package — Enhanced status codes (RFC 3463, RFC 5248):
+           - EnhancedCode{Class, Subject, Detail} struct
+           - ~25 common constants (EnhancedCodeOK, EnhancedCodeBadDest, etc.)
+           - String() → "X.Y.Z", IsZero()
+           Implemented in: enhancedcode.go
+
+  [x] 0.4  Root package — SMTPError type:
+           - Carries Code + EnhancedCode + Message
+           - Error(), Temporary(), WireLines() methods
+           - Errorf() constructor
+           Implemented in: error.go
+
+  [x] 0.5  Root package — Address types:
+           - Mailbox{LocalPart, Domain}, ReversePath{Mailbox, Null}, ForwardPath{Mailbox}
+           - ParseMailbox(), ParseReversePath(), ParseForwardPath()
+           - Validates dot-atom, quoted-string, domain labels, address literals
+           - Handles null reverse-path (<>) for bounces
+           - Accepts UTF-8 in domain labels (RFC 6531)
+           Implemented in: address.go
+
+  [x] 0.6  Root package — Extension keyword registry:
+           - Extension type (string) with 9 constants
+           - Extensions map with Has() and Param() methods
+           - ParseEHLOResponse() parses multi-line 250 reply
+           Implemented in: extension.go
+
+  [x] 0.7  internal/textproto — Connection wrapper:
+           - Conn wrapping net.Conn with bufio.Reader/Writer
+           - ReadLine(maxLen), WriteLine(line), WriteLines(lines...)
+           - SetDeadlineFromContext(ctx), ReplaceConn(nc) for TLS upgrade
+           - BufReader(), BufWriter() accessors
+           Implemented in: internal/textproto/conn.go
+
+  [x] 0.8  internal/textproto — Reply parsing:
+           - Reply{Code int, Lines []string} struct
+           - ReadReply() — handles single/multi-line, validates 3-digit code
+           - WriteReply(code, lines...) — multi-line with code-hyphen convention
+           - Cmd(format, args...) — send command + read reply
+           - ParseEnhancedCode(text) — extracts X.Y.Z from reply text
+           Implemented in: internal/textproto/conn.go
+
+  [x] 0.9  internal/textproto — Dot-stuffed DATA reader/writer:
+           - DotWriter: stuffs leading dots, Close() writes ".\r\n"
+           - DotReader: destuffs, terminates at ".\r\n" (or bare ".\n")
+           - Handles bare LF robustly (state machine tracks both \r\n and \n)
+           Implemented in: internal/textproto/dot.go
+
+  [x] 0.10 Tests for all of Phase 0:
+           - reply_test.go: class, positive, transient, permanent
+           - enhancedcode_test.go: String, IsZero
+           - error_test.go: Error, Temporary, WireLines (single/multi/empty), Errorf
+           - address_test.go: ParseMailbox (18 cases), ParseReversePath, ParseForwardPath, String
+           - extension_test.go: ParseEHLOResponse, case-insensitive, missing
+           - internal/textproto/conn_test.go: ReadLine, TooLong, WriteLine, ReadReply
+             (single/multi/no-text/invalid), WriteReply, Cmd, ParseEnhancedCode
+           - internal/textproto/dot_test.go: basic, stuffs, no-trailing-CRLF, empty,
+             multiple-dots, destuffs, round-trip (9 cases), small-buffer
+
+  ---- PHASE 0 CHECKPOINT ----
+  [x] `go build ./...` passes
+  [x] `go test ./...` passes (42 tests)
+  [x] `go vet ./...` clean
+  [x] CLAUDE.md updated to reflect actual package structure and types
+
+
+================================================================================
+  PHASE 1 — SMTP SERVER (core)                                      ✅ COMPLETE
+================================================================================
+
+  Goal: A working SMTP server that can accept connections, negotiate EHLO,
+  and receive mail through MAIL→RCPT→DATA. No extensions yet beyond the
+  base RFC 5321 command set.
+
+  [x] 1.1  Server type with functional options:
+           WithAddr, WithHostname, WithReadTimeout, WithWriteTimeout,
+           WithMaxMessageSize, WithMaxRecipients, WithTLSConfig, WithLogger
+           Implemented in: smtpserver/server.go
+
+  [x] 1.2  Handler interfaces:
+           ConnectionHandler, HeloHandler, MailHandler, RcptHandler,
+           DataHandler, ResetHandler, VrfyHandler
+           Implemented in: smtpserver/handler.go
+
+  [x] 1.3  Session management:
+           One goroutine per connection, session struct with state machine
+           (stateNew → stateGreeted → stateMail → stateRcpt → stateData → stateGreeted)
+           Tracks: clientHostname, esmtp, tls, authenticated, reversePath, forwardPaths
+           Implemented in: smtpserver/session.go
+
+  [x] 1.4  Command parser:
+           parseCommand() — case-insensitive verb extraction via strings.Cut + ToUpper
+           MAIL FROM: / RCPT TO: argument parsing with case-insensitive prefix
+           Unknown commands → 500
+           Implemented in: smtpserver/session.go
+
+  [x] 1.5  EHLO / HELO handling (RFC 5321 §4.1.1.1):
+           EHLO: multi-line 250 with hostname + extension list
+           HELO: single-line 250, marks session as non-ESMTP
+           Re-issue resets state (RFC 5321 §4.1.4)
+
+  [x] 1.6  MAIL / RCPT / DATA flow (RFC 5321 §4.1.1.2–§4.1.1.4):
+           State-enforced sequencing, handler callbacks, DotReader for DATA
+
+  [x] 1.7  RSET command (RFC 5321 §4.1.1.5)
+  [x] 1.8  NOOP command (RFC 5321 §4.1.1.9)
+  [x] 1.9  QUIT command (RFC 5321 §4.1.1.10)
+  [x] 1.10 VRFY (default 252) / EXPN (502)
+
+  [x] 1.11 Server greeting banner: "220 hostname ESMTP ready"
+
+  [x] 1.12 Graceful shutdown:
+           Shutdown(ctx) — close listener, cancel sessions, wait with deadline
+           Close() — hard close
+           Shutdown watcher goroutine closes net.Conn to unblock ReadLine
+
+  [x] 1.13 Server tests (19 tests in smtpserver/session_test.go):
+           Full conversation, state enforcement (4 tests), max recipients,
+           RSET, HELO, NOOP, VRFY, unknown command, RCPT handler reject,
+           EHLO re-issue clears state, multiple transactions, EHLO advertises
+           extensions, concurrent sessions (5 clients), graceful shutdown,
+           null reverse path, double MAIL
+
+  ---- PHASE 1 CHECKPOINT ----
+  [x] `go test ./...` passes
+  [x] `go test -race ./...` passes
+  [x] Server can receive a full email through a scripted test
+  [x] CLAUDE.md updated with server handler interfaces and session state machine
+
+
+================================================================================
+  PHASE 2 — SMTP CLIENT (core)                                      ✅ COMPLETE
+================================================================================
+
+  Goal: A working SMTP client that can connect, negotiate, and send mail.
+
+  [x] 2.1  Client type with functional options:
+           WithDialer, WithTimeout, WithLocalName, WithTLSConfig, WithLogger
+           Implemented in: smtpclient/client.go
+
+  [x] 2.2  Connection lifecycle:
+           Dial(ctx, addr, opts...) — connect, read greeting, EHLO with HELO fallback
+           NewClient(nc, localName) — wrap existing connection
+           Close() — QUIT + close
+
+  [x] 2.3  EHLO response parser:
+           Uses smtp.ParseEHLOResponse() to populate Extensions() map
+
+  [x] 2.4  Mail transaction:
+           Mail(ctx, from, ...MailOption), Rcpt(ctx, to, ...RcptOption),
+           Data(ctx, io.Reader), SendMail(ctx, from, to[], io.Reader)
+
+  [x] 2.5  Reply handling:
+           replyToError() converts textproto.Reply → *smtp.SMTPError
+           Extracts enhanced codes from reply text
+
+  [x] 2.6  Reset and connection reuse:
+           Reset(ctx), Noop(ctx)
+
+  [x] 2.7  Client tests (11 tests in smtpclient/client_test.go):
+           Dial, SendMail, multiple recipients, step-by-step, multiple transactions,
+           reset between transactions, Noop, RCPT rejected (returns SMTPError),
+           dial timeout, NewClient with pipe, HELO fallback
+
+  ---- PHASE 2 CHECKPOINT ----
+  [x] `go test ./...` passes
+  [x] `go test -race ./...` passes
+  [x] Client can send to the Phase 1 server in an integration test
+  [x] CLAUDE.md updated with client API surface
+
+
+================================================================================
+  PHASE 3 — STARTTLS (RFC 3207)                                     ✅ COMPLETE
+================================================================================
+
+  Goal: Both client and server support the STARTTLS upgrade.
+
+  [x] 3.1  Server — STARTTLS extension:
+           Advertised in EHLO when TLSConfig set and not already TLS
+           Reply 220 → tls.Server() handshake → ReplaceConn() → reset state
+           Rejects if already TLS (503)
+           Implemented in: smtpserver/session.go handleSTARTTLS()
+
+  [x] 3.2  Client — STARTTLS:
+           StartTLS(ctx, *tls.Config) — sends STARTTLS, upgrades, re-issues EHLO
+           IsTLS() reports current state
+           Implemented in: smtpclient/client.go
+
+  [x] 3.3  TLS identity verification (RFC 7817):
+           Delegated to standard crypto/tls — caller controls via tls.Config
+           (InsecureSkipVerify for testing, default verification for production)
+
+  [x] 3.4  Tests:
+           Client: starttls_test.go (3 tests): upgrade + send, not advertised, already TLS
+           Server: STARTTLS not configured → 502, full TLS upgrade + send over TLS
+
+  ---- PHASE 3 CHECKPOINT ----
+  [x] `go test ./...` passes
+  [x] `go test -race ./...` passes
+  [x] CLAUDE.md updated (TLS options, STARTTLS flow)
+
+
+================================================================================
+  PHASE 4 — AUTHENTICATION (RFC 4954, RFC 4422, RFC 4616, RFC 2195) ✅ COMPLETE
+================================================================================
+
+  Goal: SASL-based authentication for both client and server.
+
+  [x] 4.1  SASL mechanism interface:
+           SASLMechanism{Name(), Start(), Next(challenge)} in root package
+           Implemented in: auth.go
+
+  [x] 4.2  SASL PLAIN mechanism (RFC 4616):
+           PlainAuth(identity, username, password) — \x00authcid\x00passwd format
+           Implemented in: auth.go
+
+  [x] 4.3  SASL LOGIN mechanism:
+           LoginAuth(username, password) — two-step challenge/response
+           Implemented in: auth.go
+
+  [x] 4.4  SASL CRAM-MD5 mechanism (RFC 2195):
+           CramMD5Auth(username, secret) — HMAC-MD5 challenge-response
+           Implemented in: auth.go
+
+  [x] 4.5  Server — AUTH extension:
+           AuthHandler interface: Authenticate(ctx, mechanism, username, password)
+           Advertises "AUTH PLAIN LOGIN CRAM-MD5" in EHLO
+           Dispatches to authPLAIN/authLOGIN/authCRAMMD5 handlers
+           Enforces: after EHLO, before MAIL, not if already authenticated
+           Supports cancel with "*"
+           Implemented in: smtpserver/session.go, smtpserver/handler.go
+
+  [x] 4.6  Client — AUTH:
+           Auth(ctx, SASLMechanism) — handles initial response + challenge loop
+           Base64 encoding/decoding of all exchanges
+           Implemented in: smtpclient/client.go
+
+  [x] 4.7  Tests:
+           auth_test.go (root, 4 tests): PLAIN, PLAIN with identity, LOGIN, CRAM-MD5
+           smtpclient/auth_test.go (5 tests): PLAIN success, PLAIN bad creds, LOGIN, CRAM-MD5, not available
+           smtpserver/session_test.go (7 tests): PLAIN, PLAIN bad creds, LOGIN, CRAM-MD5,
+             cancel, not available, before EHLO, already authenticated
+
+  ---- PHASE 4 CHECKPOINT ----
+  [x] `go test ./...` passes
+  [x] `go test -race ./...` passes
+  [x] Client can authenticate to server in integration test
+  [x] CLAUDE.md updated (SASL interfaces, auth flow, supported mechanisms)
+
+
+================================================================================
+  PHASE 5 — SIZE EXTENSION (RFC 1870)                                ✅ COMPLETE
+================================================================================
+
+  [x] 5.1  Server:
+           Advertises "SIZE <limit>" in EHLO when maxMessageSize > 0
+           Accepts SIZE= parameter in MAIL FROM (parsed but not enforced yet)
+
+  [x] 5.2  Client:
+           WithSize(n) MailOption sends SIZE= parameter
+           ServerMaxSize() reads SIZE from EHLO extension map
+
+  [x] 5.3  Tests (in smtpclient/extensions_test.go):
+           SIZE advertised with correct value, SIZE parameter sent in MAIL FROM
+
+  ---- PHASE 5 CHECKPOINT ----
+  [x] Tests pass, CLAUDE.md updated
+
+
+================================================================================
+  PHASE 6 — PIPELINING (RFC 2920)                                   ✅ COMPLETE
+================================================================================
+
+  [x] 6.1  Server:
+           Advertises PIPELINING in EHLO
+           Command loop naturally handles pipelined input (buffered reader)
+
+  [x] 6.2  Client:
+           Detects PIPELINING in EHLO extension map
+
+  [x] 6.3  Tests:
+           PIPELINING advertised in EHLO (verified in extensions_test.go)
+
+  ---- PHASE 6 CHECKPOINT ----
+  [x] Tests pass, CLAUDE.md updated
+
+
+================================================================================
+  PHASE 7 — 8BITMIME (RFC 6152)                                     ✅ COMPLETE
+================================================================================
+
+  [x] 7.1  Server:
+           Advertises 8BITMIME in EHLO
+           Accepts BODY=8BITMIME / BODY=7BIT in MAIL FROM
+
+  [x] 7.2  Client:
+           WithBody("8BITMIME") MailOption
+
+  [x] 7.3  Tests:
+           8BITMIME advertised, BODY=8BITMIME accepted, UTF-8 body delivered
+
+  ---- PHASE 7 CHECKPOINT ----
+  [x] Tests pass, CLAUDE.md updated
+
+
+================================================================================
+  PHASE 8 — ENHANCED STATUS CODES (RFC 2034, RFC 3463, RFC 5248)     ✅ COMPLETE
+================================================================================
+
+  [x] 8.1  Server:
+           Advertises ENHANCEDSTATUSCODES in EHLO
+           All reply lines include enhanced codes (e.g., "250 2.1.0 Originator ok")
+
+  [x] 8.2  Client:
+           replyToError() extracts enhanced codes via ParseEnhancedCode()
+           Populates SMTPError.EnhancedCode
+
+  [x] 8.3  Tests:
+           Enhanced codes verified in extension advertisement tests
+           Client error extraction tested in RCPT reject + AUTH failure tests
+
+  ---- PHASE 8 CHECKPOINT ----
+  [x] Tests pass, CLAUDE.md updated
+
+
+================================================================================
+  PHASE 9 — DSN (RFC 3461)                                          ✅ COMPLETE
+================================================================================
+
+  [x] 9.1  Server:
+           Advertises DSN in EHLO
+           Accepts RET=, ENVID= in MAIL FROM and NOTIFY=, ORCPT= in RCPT TO
+
+  [x] 9.2  Client:
+           WithDSNReturn(ret), WithDSNEnvelopeID(envid) MailOptions
+           WithDSNNotify(notify), WithDSNOriginalRecipient(orcpt) RcptOptions
+           Implemented in: smtpclient/options.go
+
+  [x] 9.3  Tests:
+           Full round-trip with all DSN parameters (extensions_test.go)
+
+  ---- PHASE 9 CHECKPOINT ----
+  [x] Tests pass, CLAUDE.md updated
+
+
+================================================================================
+  PHASE 10 — SMTPUTF8 (RFC 6531, RFC 6530)                          ✅ COMPLETE
+================================================================================
+
+  [x] 10.1 Server:
+           Advertises SMTPUTF8 in EHLO
+           Accepts SMTPUTF8 parameter in MAIL FROM
+
+  [x] 10.2 Client:
+           WithSMTPUTF8() MailOption
+
+  [x] 10.3 Address parsing:
+           Mailbox domain validation already accepts UTF-8 (isDomainChar allows r > 127)
+
+  [x] 10.4 Tests:
+           SMTPUTF8 advertised, parameter accepted, message delivered
+
+  ---- PHASE 10 CHECKPOINT ----
+  [x] Tests pass, CLAUDE.md updated
+
+
+================================================================================
+  PHASE 11 — CHUNKING / BDAT (RFC 3030)                             ✅ COMPLETE
+================================================================================
+
+  [x] 11.1 Server:
+           Advertises CHUNKING in EHLO
+           handleBDAT() — parses size + LAST, reads exact bytes, accumulates in bdatBuffer
+           Delivers assembled message to DataHandler on LAST
+           Implemented in: smtpserver/session.go
+
+  [x] 11.2 Client:
+           Bdat(ctx, data []byte, last bool) — sends "BDAT <size> [LAST]" + raw data
+           Implemented in: smtpclient/client.go
+
+  [x] 11.3 Tests:
+           Client: single BDAT LAST, multiple BDAT chunks (extensions_test.go)
+           Server: single BDAT, multiple chunks, BDAT before RCPT (session_test.go)
+
+  ---- PHASE 11 CHECKPOINT ----
+  [x] Tests pass, CLAUDE.md updated
+
+
+================================================================================
+  PHASE 12 — MESSAGE SUBMISSION (RFC 6409)                           ✅ COMPLETE
+================================================================================
+
+  Goal: Support for port 587 message submission semantics.
+
+  [x] 12.1 Server — submission mode:
+           - Option: WithSubmissionMode(true)
+           - Require authentication before MAIL (reject with 530 otherwise)
+           Implemented in: smtpserver/server.go, smtpserver/session.go
+
+  [x] 12.2 Client — submission helpers:
+           - SubmitMessage(ctx, mech, tlsConfig, from, to, body)
+             STARTTLS (if available) → AUTH → SendMail
+           Implemented in: smtpclient/client.go
+
+  [x] 12.3 Tests:
+           - Client: submission without auth → 530, auth then send, SubmitMessage full flow
+             (smtpclient/submission_test.go, 3 tests)
+           - Server: unauthenticated MAIL → 530, auth then MAIL succeeds
+             (smtpserver/session_test.go, 2 tests)
+
+  ---- PHASE 12 CHECKPOINT ----
+  [x] Tests pass, CLAUDE.md updated
+
+
+================================================================================
+  PHASE 13 — ROBUSTNESS & EDGE CASES                                ✅ COMPLETE
+================================================================================
+
+  Goal: Harden the implementation against real-world abuse and malformed input.
+
+  [x] 13.1 Line length limits:
+           - Command line: MaxCommandLineLen = 512 in textproto
+           - Reply line: MaxReplyLineLen = 2048 in textproto
+           - ReadLine(maxLen) enforced in conn.go
+
+  [x] 13.2 Timeout enforcement:
+           - Server: configurable readTimeout/writeTimeout (default 5 min)
+           - SetReadDeadline set before each ReadLine in command loop
+           - Client: configurable via WithTimeout (default 30s for dial+greeting)
+           - All deadlines wired through context via SetDeadlineFromContext
+
+  [x] 13.3 Connection limits:
+           - Server: WithMaxConnections(n) — semaphore-based limiting
+           - Excess connections receive 421 and are closed
+           Implemented in: smtpserver/server.go
+
+  [x] 13.4 Input validation:
+           - Bare LF handling in DATA (dot reader state machine fixed)
+           - Malformed paths rejected in MAIL/RCPT via ParseReversePath/ParseForwardPath
+           - Unrecognized commands → 500
+           - NUL bytes rejected in commands (500)
+
+  [x] 13.5 Invalid command limits:
+           - WithMaxInvalidCommands(n) (default 10) — disconnects after too many errors
+           - Applies to unknown commands and NUL bytes
+           Implemented in: smtpserver/session.go
+
+  [x] 13.6 Fuzz tests:
+           - FuzzDotRoundTrip — dot-stuffing round-trip (no crashes)
+           - FuzzReadReply — reply parsing (no crashes)
+           Implemented in: internal/textproto/fuzz_test.go
+
+  [x] 13.7 Tests:
+           - MaxConnections: 2-conn limit, 3rd rejected with 421, slot freed after disconnect
+           - MaxInvalidCommands: 3 invalid commands → disconnect with 421
+           - NUL byte: rejected with 500
+           (smtpserver/session_test.go)
+
+  ---- PHASE 13 CHECKPOINT ----
+  [x] `go test -race -count=1 ./...` passes
+  [x] Fuzz tests run without crashes
+  [x] CLAUDE.md updated
+
+
+================================================================================
+  PHASE 14 — INTEGRATION TESTING & INTEROP                          ✅ COMPLETE
+================================================================================
+
+  Goal: End-to-end tests that exercise real TCP, TLS, and full mail flows.
+
+  [x] 14.1 Integration test harness:
+           startTestServer(t, ...opts) helper in smtpclient/*_test.go
+           Real TCP with ephemeral ports, client↔server integration
+
+  [x] 14.2 Multiple client scenarios:
+           - Single message to single recipient (TestSendMail)
+           - Single message to many recipients (TestSendMail_MultipleRecipients)
+           - Multiple messages on one connection (TestMultipleTransactions)
+           - RSET between transactions (TestResetBetweenTransactions)
+           - BDAT-based delivery (TestBDAT, TestBDAT_MultipleChunks)
+           - STARTTLS + send (TestSTARTTLS)
+           - AUTH PLAIN/LOGIN/CRAM-MD5 + send (auth_test.go)
+           - Some recipients rejected (TestRcptRejected)
+
+  [x] 14.3 Error scenarios:
+           - Dial timeout (TestDialTimeout)
+           - RCPT rejected → SMTPError (TestRcptRejected)
+           - AUTH failure → SMTPError (TestAuth_PLAIN_BadCredentials)
+           - STARTTLS not available → error (TestSTARTTLS_NotAdvertised)
+           - Double STARTTLS → 503 (TestSTARTTLS_AlreadyTLS)
+
+  [x] 14.4 Concurrency stress tests:
+           TestConcurrentSessions — 5 concurrent clients, race detector clean
+           TestConcurrent100Clients — 100 concurrent clients, all successful
+
+  [x] 14.5 Goroutine leak detection:
+           TestGoroutineLeak — 10 clients, shutdown, verify goroutine count
+
+  [x] 14.6 Benchmarks (smtpclient/benchmark_test.go):
+           BenchmarkSendMail — single-message latency (~62µs)
+           BenchmarkSendMailConcurrent — concurrent throughput (~37µs)
+           BenchmarkLargeMessage — 10MB transfer (207 MB/s)
+
+  ---- PHASE 14 CHECKPOINT ----
+  [x] Core integration tests pass
+  [x] `go test -race -count=1 ./...` passes
+  [x] Benchmarks run and produce meaningful results
+  [x] CLAUDE.md updated
+
+
+================================================================================
+  PHASE 15 — API POLISH & DOCUMENTATION                              ✅ COMPLETE
+================================================================================
+
+  Goal: Make the public API clean, consistent, and well-documented.
+
+  [x] 15.1 Package-level documentation:
+           - doc.go in root package, smtpclient, and smtpserver
+           - Overview, quick start examples, cross-references
+
+  [x] 15.2 Testable examples:
+           - smtpserver/example_test.go: Example (minimal server), Example_withTLS,
+             Example_submissionMode (3 examples with Output)
+           - smtpclient/example_test.go: Example (send), ExampleClient_StartTLS,
+             ExampleClient_Auth, ExampleClient_SubmitMessage (4 examples)
+
+  [x] 15.3 README.md:
+           - Project overview, installation, features list
+           - Quick start: client and server code snippets
+           - Message submission example
+           - Handler interfaces table
+           - Package structure table
+           - RFC reference list
+
+  ---- PHASE 15 CHECKPOINT ----
+  [x] All examples compile: `go test -run Example ./...` passes
+  [x] CLAUDE.md is accurate and complete
+  [x] README.md describes the library
+
+
+================================================================================
+  PHASE 16 — FINAL VERIFICATION                                      ✅ COMPLETE
+================================================================================
+
+  The library is done when ALL of these pass:
+
+  [x] `go build ./...`                     — compiles cleanly
+  [x] `go vet ./...`                       — no issues
+  [x] `go test ./... -race -count=1`       — all 117 tests pass, no races
+  [x] Coverage analysis:
+        Root package:     85.9%
+        internal/textproto: 61.1%
+        smtpclient:       77.6%
+        smtpserver:       70.6%
+        Total:            72.9%
+  [x] `go test -run Example ./...`         — 3 server examples pass
+  [x] `go test -fuzz=. -fuzztime=5s ./internal/textproto`  — no crashes
+  [x] `go test -bench=. ./smtpclient`     — benchmarks run successfully
+  [x] Zero external dependencies            — go.sum absent (confirmed)
+  [x] CLAUDE.md matches the implemented architecture exactly
+  [x] README.md is complete
+  [x] All TODO items in this file are [x]
+
+
+================================================================================
+  NOTES & DECISIONS LOG
+================================================================================
+
+  Record architectural decisions, trade-offs, and open questions here as work
+  progresses. Format: DATE — DECISION — RATIONALE
+
+  2026-02-13 — Bare LF handling in dot reader — Fuzz testing revealed that bare
+    LF (\n without \r) broke the dot reader's line tracking. Fixed the state
+    machine to treat both \r\n and bare \n as line endings. Also added bare
+    ".\n" as a termination sequence for robustness. SMTP spec requires \r\n but
+    being lenient on input follows Postel's law.
+
+  2026-02-13 — CRAM-MD5 auth handler interface — Rather than having the server
+    compute HMAC-MD5 internally (which requires storing plaintext passwords), we
+    pass "challenge:digest" as the password field to AuthHandler.Authenticate().
+    This lets the handler decide how to verify (e.g., compute HMAC with stored
+    secret and compare digests).
+
+  2026-02-13 — DSN parameters accepted but not validated — The server accepts
+    RET=, ENVID=, NOTIFY=, ORCPT= parameters in MAIL/RCPT but does not validate
+    their values or enforce DSN semantics. They are pass-through to handlers.
+    Full DSN generation (bounce messages) is out of scope for the library.
+
+  2026-02-13 — Pipelining is advertised but no batched client API — The server
+    naturally handles pipelined commands (buffered reader), and the client detects
+    PIPELINING. A dedicated Pipeline() method for batching MAIL+RCPT writes is a
+    future enhancement. Sequential send+read works correctly today.
+
+  2026-02-13 — Submission mode uses auth-before-MAIL only — RFC 6409 also
+    mentions header fixup (Message-ID, Date) and From-header validation. Our
+    WithSubmissionMode() only enforces the authentication requirement. Header
+    manipulation is left to the application layer, which is the appropriate
+    place for policy decisions.
+
+  2026-02-13 — Connection limiting uses non-blocking semaphore — MaxConnections
+    is enforced with a buffered channel used as a semaphore. When at capacity,
+    new connections receive 421 immediately rather than queuing. This prevents
+    resource exhaustion from slow clients.
+
+  2026-02-13 — Invalid command limit disconnects with 421 — After MaxInvalidCmds
+    (default 10) unknown commands or NUL-containing lines, the server sends 421
+    and closes the connection. This prevents abuse from clients sending garbage.
